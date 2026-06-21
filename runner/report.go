@@ -71,6 +71,72 @@ func PrintComparison(stats []Stats) {
 	printVerdict(stats)
 }
 
+// PrintModelSummary 打印多模型固定并发测试的最终汇总。
+func PrintModelSummary(stats []Stats) {
+	if len(stats) <= 1 {
+		return
+	}
+	fmt.Println()
+	printBoxTitle("Model Summary")
+	fmt.Printf("  %-28s %-12s %-10s %-6s %-10s %-13s %-13s %-10s\n",
+		"model", "mode", "ok/total", "fail", "tokens", "throughput", "p95 latency", "p95 TTFT")
+	for _, s := range stats {
+		ttft := "-"
+		if s.Stream && s.TTFTStat.Count > 0 {
+			ttft = dur(s.TTFTStat.P95)
+		}
+		mode := pad(modeName(s.Stream), 12)
+		if s.Failed > 0 {
+			mode = term.Yellow(mode)
+		} else {
+			mode = term.Green(mode)
+		}
+		fmt.Printf("  %-28s %s %-10s %-6d %-10s %-13s %-13s %-10s\n",
+			trunc(s.Model, 28),
+			mode,
+			fmt.Sprintf("%d/%d", s.Success, s.Total),
+			s.Failed,
+			intFmt(s.CompletionTokens),
+			fmt.Sprintf("%.2f/s", s.TotalThroughput),
+			dur(s.TotalLatency.P95),
+			ttft)
+	}
+	printBestThroughput(stats)
+}
+
+// PrintStaircaseModelSummary 打印多模型阶梯扫描的最终汇总。
+func PrintStaircaseModelSummary(results []StaircaseResult) {
+	if len(results) <= 1 {
+		return
+	}
+	fmt.Println()
+	printBoxTitle("Model Staircase Summary")
+	fmt.Printf("  %-28s %-12s %-6s %-8s %-10s %-13s %-13s %-10s\n",
+		"model", "mode", "level", "threads", "ok/total", "throughput", "p95 latency", "fail")
+	for _, r := range results {
+		s := r.Stats
+		failRate := 0.0
+		if s.Total > 0 {
+			failRate = float64(s.Failed) / float64(s.Total) * 100
+		}
+		mode := pad(modeName(s.Stream), 12)
+		if s.Failed > 0 {
+			mode = term.Yellow(mode)
+		} else {
+			mode = term.Green(mode)
+		}
+		fmt.Printf("  %-28s %s %-6d %-8d %-10s %-13s %-13s %-10s\n",
+			trunc(s.Model, 28),
+			mode,
+			r.Level,
+			r.Concurrency,
+			fmt.Sprintf("%d/%d", s.Success, s.Total),
+			fmt.Sprintf("%.2f/s", s.TotalThroughput),
+			dur(s.TotalLatency.P95),
+			fmt.Sprintf("%.1f%%", failRate))
+	}
+}
+
 func printRunHeader(title string, s Stats) {
 	fmt.Println()
 	printBoxTitle(title)
@@ -193,7 +259,7 @@ func SaveReport(rep Report) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("%s_%s_%s.json", rep.Timestamp, rep.Mode, reportStreamName(rep.Stream))
+	name := fmt.Sprintf("%s_%s_%s_%s.json", rep.Timestamp, reportModelName(rep.Model), rep.Mode, reportStreamName(rep.Stream))
 	path := filepath.Join(dir, name)
 	f, err := os.Create(path)
 	if err != nil {
@@ -234,6 +300,33 @@ func reportStreamName(stream bool) string {
 		return "stream"
 	}
 	return "nonstream"
+}
+
+func reportModelName(model string) string {
+	if model == "" {
+		return "model"
+	}
+	var b strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(model) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "model"
+	}
+	if len(out) > 48 {
+		out = out[:48]
+	}
+	return out
 }
 
 func printLatencyLine(label string, ls LatencyStat, isTPS bool) {
@@ -358,6 +451,25 @@ func printVerdict(stats []Stats) {
 	}
 }
 
+func printBestThroughput(stats []Stats) {
+	var best *Stats
+	for i := range stats {
+		s := &stats[i]
+		if s.Success == 0 {
+			continue
+		}
+		if best == nil || s.TotalThroughput > best.TotalThroughput {
+			best = s
+		}
+	}
+	if best == nil {
+		return
+	}
+	fmt.Println()
+	fmt.Println(term.Cyan("Best"))
+	fmt.Printf("  throughput  %s  %s  %.2f tok/s\n", best.Model, modeName(best.Stream), best.TotalThroughput)
+}
+
 func dur(d time.Duration) string {
 	if d <= 0 {
 		return "-"
@@ -389,6 +501,16 @@ func compact(s string, maxLen int) string {
 		return s[:maxLen-3] + "..."
 	}
 	return s
+}
+
+func trunc(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
 }
 
 func pad(s string, width int) string {

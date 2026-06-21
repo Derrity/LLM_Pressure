@@ -31,7 +31,7 @@ type cliOptions struct {
 	concurrency int
 	requests    int
 	profileName string
-	model       string
+	models      []string
 }
 
 func main() {
@@ -60,23 +60,23 @@ func parseFlags() cliOptions {
 	flag.IntVar(&opts.concurrency, "t", 0, "固定并发线程数；设置后不进入交互选择，直接跑固定并发")
 	flag.IntVar(&opts.requests, "n", defaultRequests, "总请求数；固定并发为总量，交互阶梯扫描为每档请求数")
 	flag.StringVar(&opts.profileName, "profile", "", "使用指定 profile 名称")
-	flag.StringVar(&opts.model, "model", "", "使用指定模型 ID")
+	var modelFlags modelFlag
+	flag.Var(&modelFlags, "model", "使用指定模型 ID；多个模型可用逗号分隔或重复传入")
 	profileShort := flag.String("p", "", "使用指定 profile 名称（简写）")
-	modelShort := flag.String("m", "", "使用指定模型 ID（简写）")
+	flag.Var(&modelFlags, "m", "使用指定模型 ID（简写）；多个模型可用逗号分隔或重复传入")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "用法:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s                  交互选择 provider/model，默认跑阶梯扫描\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -t 8 -n 50       使用默认 profile 和上次模型，直接跑固定并发\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2 -t 8 -n 50\n\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2,kimi-2.6 -t 8 -n 50\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	if *profileShort != "" {
 		opts.profileName = *profileShort
 	}
-	if *modelShort != "" {
-		opts.model = *modelShort
-	}
+	opts.models = modelFlags.Models()
 	if flag.NArg() > 0 {
 		die("不支持的位置参数: %s", strings.Join(flag.Args(), " "))
 	}
@@ -99,24 +99,22 @@ func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 
 	client := api.New(profile.BaseURL, profile.APIKey)
 
-	model := selectModel(ctx, client)
-	if model == "" {
+	models := selectModels(ctx, client)
+	if len(models) == 0 {
 		die("模型 ID 不能为空")
 	}
-	cfg.SetLastModel(profile.Name, model)
+	cfg.SetLastModel(profile.Name, strings.Join(models, ","))
 	if err := cfg.Save(); err != nil {
 		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
-	printModel(model)
+	printModels(models)
 
 	params := testParams{
 		requests:    int64(opts.requests),
 		stairLevels: append([]int(nil), defaultStairLevels...),
 	}
-	req := defaultChatRequest(model)
-
 	printBuiltinSettings("staircase", fmt.Sprintf("levels=%v  requests/level=%d", params.stairLevels, params.requests))
-	runStaircaseAuto(ctx, client, req, params, model)
+	runStaircaseForModels(ctx, client, params, models)
 }
 
 func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
@@ -124,30 +122,28 @@ func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
 	cfg.SetDefault(profile.Name)
 	printProvider(profile)
 
-	model := opts.model
-	if model == "" {
-		model = profile.LastModel
+	models := opts.models
+	if len(models) == 0 {
+		models = splitModels(profile.LastModel)
 	}
-	if model == "" {
+	if len(models) == 0 {
 		die("参数模式缺少模型：请加 -m <model>，或先运行一次交互模式选择模型以记录 last_model")
 	}
 
-	cfg.SetLastModel(profile.Name, model)
+	cfg.SetLastModel(profile.Name, strings.Join(models, ","))
 	if err := cfg.Save(); err != nil {
 		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
 
-	printModel(model)
+	printModels(models)
 
 	client := api.New(profile.BaseURL, profile.APIKey)
 	params := testParams{
 		concurrency: opts.concurrency,
 		requests:    int64(opts.requests),
 	}
-	req := defaultChatRequest(model)
-
 	printBuiltinSettings("fixed concurrency", fmt.Sprintf("threads=%d  requests=%d", params.concurrency, params.requests))
-	runFixedAuto(ctx, client, req, params, model)
+	runFixedForModels(ctx, client, params, models)
 }
 
 // ---- 流程步骤 ----
@@ -185,31 +181,52 @@ func createProfile(cfg *config.File) config.Profile {
 	return p
 }
 
-func selectModel(ctx context.Context, client *api.Client) string {
+func selectModels(ctx context.Context, client *api.Client) []string {
 	fmt.Println("\n正在查询可用模型...")
 	models, err := client.ListModels(ctx)
 	if err != nil {
 		fmt.Printf("查询模型失败: %v\n", err)
 		fmt.Println("将手动输入模型 ID。")
-		return ui.Prompt("模型 ID", "")
+		return splitModels(ui.Prompt("模型 ID（多个用逗号分隔）", ""))
 	}
 	if len(models) == 0 {
 		fmt.Println("接口返回空模型列表。")
-		return ui.Prompt("模型 ID", "")
+		return splitModels(ui.Prompt("模型 ID（多个用逗号分隔）", ""))
 	}
 	opts := make([]ui.SelectOption, len(models))
 	for i, m := range models {
 		desc := m.OwnedBy
 		opts[i] = ui.SelectOption{Label: m.ID, Desc: desc}
 	}
-	idx, _ := ui.Select(fmt.Sprintf("选择模型（共 %d 个）：", len(opts)), opts, false)
-	return opts[idx].Label
+	idxs := ui.MultiSelect(fmt.Sprintf("选择模型（共 %d 个）：", len(opts)), opts)
+	out := make([]string, 0, len(idxs))
+	for _, idx := range idxs {
+		out = append(out, opts[idx].Label)
+	}
+	return out
 }
 
 type testParams struct {
 	concurrency int
 	requests    int64
 	stairLevels []int
+}
+
+type modelFlag struct {
+	values []string
+}
+
+func (m *modelFlag) String() string {
+	return strings.Join(m.values, ",")
+}
+
+func (m *modelFlag) Set(value string) error {
+	m.values = append(m.values, splitModels(value)...)
+	return nil
+}
+
+func (m *modelFlag) Models() []string {
+	return dedupeStrings(m.values)
 }
 
 func selectProfileFromFlags(cfg *config.File, name string) config.Profile {
@@ -244,28 +261,55 @@ func printBuiltinSettings(mode, detail string) {
 	fmt.Printf("%s %s\n", colorLabel("Modes", 11), "auto-detect non-stream and stream")
 }
 
-func runFixedAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
+func runFixedForModels(ctx context.Context, client *api.Client, p testParams, models []string) {
+	var all []runner.Stats
+	for idx, model := range models {
+		if ctx.Err() != nil {
+			break
+		}
+		printModelRunHeader(idx+1, len(models), model)
+		all = append(all, runFixedAuto(ctx, client, defaultChatRequest(model), p, model)...)
+	}
+	runner.PrintModelSummary(all)
+}
+
+func runFixedAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) []runner.Stats {
 	modes := detectSupportedModes(ctx, client, req)
 	var summaries []runner.Stats
 	for _, stream := range modes {
 		if ctx.Err() != nil {
-			return
+			return summaries
 		}
 		if stats, ok := runFixed(ctx, client, req, p, model, stream); ok {
 			summaries = append(summaries, stats)
 		}
 	}
 	runner.PrintComparison(summaries)
+	return summaries
 }
 
-func runStaircaseAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
+func runStaircaseForModels(ctx context.Context, client *api.Client, p testParams, models []string) {
+	var all []runner.StaircaseResult
+	for idx, model := range models {
+		if ctx.Err() != nil {
+			break
+		}
+		printModelRunHeader(idx+1, len(models), model)
+		all = append(all, runStaircaseAuto(ctx, client, defaultChatRequest(model), p, model)...)
+	}
+	runner.PrintStaircaseModelSummary(all)
+}
+
+func runStaircaseAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) []runner.StaircaseResult {
 	modes := detectSupportedModes(ctx, client, req)
+	var all []runner.StaircaseResult
 	for _, stream := range modes {
 		if ctx.Err() != nil {
-			return
+			return all
 		}
-		runStaircase(ctx, client, req, p, model, stream)
+		all = append(all, runStaircase(ctx, client, req, p, model, stream)...)
 	}
+	return all
 }
 
 func detectSupportedModes(ctx context.Context, client *api.Client, req api.ChatRequest) []bool {
@@ -336,7 +380,7 @@ func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p te
 	return stats, true
 }
 
-func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) {
+func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) []runner.StaircaseResult {
 	perLevelRequests := p.requests
 
 	progressCb := makeProgressCB()
@@ -372,6 +416,7 @@ func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, 
 	} else {
 		fmt.Printf("\n保存报告失败: %v\n", err)
 	}
+	return results
 }
 
 func makeProgressCB() func(runner.Progress) {
@@ -404,6 +449,32 @@ func compactForLine(s string, maxLen int) string {
 		return s[:maxLen-3] + "..."
 	}
 	return s
+}
+
+func splitModels(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		model := strings.TrimSpace(part)
+		if model == "" {
+			continue
+		}
+		out = append(out, model)
+	}
+	return dedupeStrings(out)
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func reportRequestFrom(req api.ChatRequest) runner.ReportRequest {
@@ -445,6 +516,22 @@ func printProvider(profile config.Profile) {
 
 func printModel(model string) {
 	fmt.Printf("%s %s\n", colorLabel("Model", 11), model)
+}
+
+func printModels(models []string) {
+	if len(models) == 1 {
+		printModel(models[0])
+		return
+	}
+	fmt.Printf("%s %d selected\n", colorLabel("Models", 11), len(models))
+	for i, model := range models {
+		fmt.Printf("  %2d. %s\n", i+1, model)
+	}
+}
+
+func printModelRunHeader(current, total int, model string) {
+	fmt.Println()
+	fmt.Printf("%s %d/%d  %s\n", term.Cyan("Model"), current, total, model)
 }
 
 func colorLabel(s string, width int) string {
