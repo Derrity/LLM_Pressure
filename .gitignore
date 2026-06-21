@@ -1,0 +1,22 @@
+# 配置与结果（避免 key 入库）
+config.json
+results/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+llm_pressure
+/llm_pressure
+bin/
+dist/
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
