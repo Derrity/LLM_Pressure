@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -23,11 +24,70 @@ type Client struct {
 
 // New 构造一个客户端，默认 10 分钟超时（流式长输出不会被过早打断）
 func New(baseURL, apiKey string) *Client {
+	if normalized, err := NormalizeBaseURL(baseURL); err == nil {
+		baseURL = normalized
+	}
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		HTTP:    &http.Client{Timeout: 10 * time.Minute},
 	}
+}
+
+// NormalizeBaseURL accepts host, /v1, or full /v1/chat/completions URLs and
+// returns the OpenAI-compatible base URL used before /models and /chat/completions.
+func NormalizeBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("Base URL 不能为空")
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("无效 Base URL: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("无效 Base URL %q：需要包含协议和域名", raw)
+	}
+
+	u.RawQuery = ""
+	u.Fragment = ""
+
+	parts := pathParts(u.Path)
+	if len(parts) >= 2 && parts[len(parts)-2] == "chat" && parts[len(parts)-1] == "completions" {
+		parts = parts[:len(parts)-2]
+	}
+
+	v1Index := -1
+	for i, part := range parts {
+		if part == "v1" {
+			v1Index = i
+		}
+	}
+	if v1Index >= 0 {
+		parts = parts[:v1Index+1]
+	} else {
+		parts = append(parts, "v1")
+	}
+
+	u.Path = "/" + strings.Join(parts, "/")
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func pathParts(path string) []string {
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return nil
+	}
+	raw := strings.Split(path, "/")
+	parts := make([]string, 0, len(raw))
+	for _, part := range raw {
+		if part == "" {
+			continue
+		}
+		parts = append(parts, part)
+	}
+	return parts
 }
 
 // Model 表示 /models 接口里的一个模型条目

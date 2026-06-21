@@ -8,18 +8,18 @@ import (
 
 // Sample 是一次请求的采样数据
 type Sample struct {
-	WorkerID        int           `json:"worker_id"`
-	Stream          bool          `json:"stream"`
-	Success         bool          `json:"success"`
-	HTTPStatus      int           `json:"http_status,omitempty"`
-	ErrMsg          string        `json:"err,omitempty"`
-	TotalLatency    time.Duration `json:"total_latency_ns"`
-	TTFT            time.Duration `json:"ttft_ns,omitempty"`
-	GenerationTime  time.Duration `json:"generation_time_ns"`
-	PromptTokens    int           `json:"prompt_tokens"`
-	CompletionTokens int          `json:"completion_tokens"`
-	TotalTokens     int           `json:"total_tokens"`
-	TokenSource     string        `json:"token_source,omitempty"`
+	WorkerID         int           `json:"worker_id"`
+	Stream           bool          `json:"stream"`
+	Success          bool          `json:"success"`
+	HTTPStatus       int           `json:"http_status,omitempty"`
+	ErrMsg           string        `json:"err,omitempty"`
+	TotalLatency     time.Duration `json:"total_latency_ns"`
+	TTFT             time.Duration `json:"ttft_ns,omitempty"`
+	GenerationTime   time.Duration `json:"generation_time_ns"`
+	PromptTokens     int           `json:"prompt_tokens"`
+	CompletionTokens int           `json:"completion_tokens"`
+	TotalTokens      int           `json:"total_tokens"`
+	TokenSource      string        `json:"token_source,omitempty"`
 }
 
 // LatencyStat 是一组延迟/耗时的分布统计
@@ -35,37 +35,39 @@ type LatencyStat struct {
 
 // WorkerStat 是单个 worker 的统计
 type WorkerStat struct {
-	WorkerID        int           `json:"worker_id"`
-	Count           int           `json:"count"`
-	Success         int           `json:"success"`
-	Failed          int           `json:"failed"`
-	CompletionTokens int          `json:"completion_tokens"`
-	WallTime        time.Duration `json:"wall_time_ns"`
-	TPS             float64       `json:"tps"` // 该 worker 在其活跃时段内的 tokens/s
+	WorkerID         int           `json:"worker_id"`
+	Count            int           `json:"count"`
+	Success          int           `json:"success"`
+	Failed           int           `json:"failed"`
+	CompletionTokens int           `json:"completion_tokens"`
+	WallTime         time.Duration `json:"wall_time_ns"`
+	TPS              float64       `json:"tps"` // 该 worker 在其活跃时段内的 tokens/s
 }
 
 // Stats 是一组采样聚合后的统计结果
 type Stats struct {
-	Mode         string        `json:"mode"`
-	Concurrency  int           `json:"concurrency"`
-	Stream       bool          `json:"stream"`
-	Model        string        `json:"model"`
-	WallTime     time.Duration `json:"wall_time_ns"`
-	Total        int           `json:"total"`
-	Success      int           `json:"success"`
-	Failed       int           `json:"failed"`
-	CompletionTokens int       `json:"completion_tokens"`
-	PromptTokens int           `json:"prompt_tokens"`
-	TotalThroughput float64    `json:"total_throughput_tps"` // 总吞吐 tokens/s
+	Mode             string        `json:"mode"`
+	Concurrency      int           `json:"concurrency"`
+	Stream           bool          `json:"stream"`
+	Model            string        `json:"model"`
+	WallTime         time.Duration `json:"wall_time_ns"`
+	Total            int           `json:"total"`
+	Success          int           `json:"success"`
+	Failed           int           `json:"failed"`
+	CompletionTokens int           `json:"completion_tokens"`
+	PromptTokens     int           `json:"prompt_tokens"`
+	TotalThroughput  float64       `json:"total_throughput_tps"` // 总吞吐 tokens/s
+	AvgThreadTPS     float64       `json:"avg_thread_tps"`       // 活跃 worker 的平均单线程 tokens/s
+	BestThreadTPS    float64       `json:"best_thread_tps"`      // 活跃 worker 中最快的 tokens/s
 
 	TotalLatency LatencyStat `json:"total_latency"`
 	TTFTStat     LatencyStat `json:"ttft"`
 	GenTimeStat  LatencyStat `json:"generation_time"`
 	ReqTPSStat   LatencyStat `json:"req_tps"` // 单请求 TPS 分布
 
-	Workers        []WorkerStat        `json:"workers"`
-	ErrorDist      map[string]int      `json:"error_dist,omitempty"`
-	EstimatedTokens bool               `json:"estimated_tokens"`
+	Workers         []WorkerStat   `json:"workers"`
+	ErrorDist       map[string]int `json:"error_dist,omitempty"`
+	EstimatedTokens bool           `json:"estimated_tokens"`
 }
 
 // Aggregate 把一批 Sample 聚合成 Stats
@@ -157,8 +159,28 @@ func Aggregate(samples []Sample, mode string, concurrency int, stream bool, mode
 		}
 		s.Workers = append(s.Workers, *ws)
 	}
+	s.AvgThreadTPS, s.BestThreadTPS = workerTPSSummary(s.Workers)
 
 	return s
+}
+
+func workerTPSSummary(ws []WorkerStat) (avg, best float64) {
+	var sum float64
+	var count int
+	for _, w := range ws {
+		if w.Success == 0 || w.TPS <= 0 {
+			continue
+		}
+		sum += w.TPS
+		count++
+		if w.TPS > best {
+			best = w.TPS
+		}
+	}
+	if count == 0 {
+		return 0, 0
+	}
+	return sum / float64(count), best
 }
 
 func latencyStatOf(ds []time.Duration) LatencyStat {

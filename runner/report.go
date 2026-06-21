@@ -46,8 +46,8 @@ func PrintComparison(stats []Stats) {
 	}
 	fmt.Println()
 	printBoxTitle("Comparison")
-	fmt.Printf("  %-12s %-10s %-6s %-10s %-13s %-13s %-10s\n",
-		"mode", "ok/total", "fail", "tokens", "throughput", "p95 latency", "p95 TTFT")
+	fmt.Printf("  %-12s %-10s %-6s %-10s %-13s %-12s %-12s %-13s %-10s\n",
+		"mode", "ok/total", "fail", "tokens", "throughput", "avg thread", "best thread", "p95 latency", "p95 TTFT")
 	for _, s := range stats {
 		ttft := "-"
 		if s.Stream && s.TTFTStat.Count > 0 {
@@ -59,12 +59,14 @@ func PrintComparison(stats []Stats) {
 		} else {
 			mode = term.Green(mode)
 		}
-		fmt.Printf("  %s %-10s %-6d %-10s %-13s %-13s %-10s\n",
+		fmt.Printf("  %s %-10s %-6d %-10s %-13s %-12s %-12s %-13s %-10s\n",
 			mode,
 			fmt.Sprintf("%d/%d", s.Success, s.Total),
 			s.Failed,
 			intFmt(s.CompletionTokens),
 			fmt.Sprintf("%.2f/s", s.TotalThroughput),
+			fmt.Sprintf("%.2f/s", s.AvgThreadTPS),
+			fmt.Sprintf("%.2f/s", s.BestThreadTPS),
 			dur(s.TotalLatency.P95),
 			ttft)
 	}
@@ -78,8 +80,8 @@ func PrintModelSummary(stats []Stats) {
 	}
 	fmt.Println()
 	printBoxTitle("Model Summary")
-	fmt.Printf("  %-28s %-12s %-10s %-6s %-10s %-13s %-13s %-10s\n",
-		"model", "mode", "ok/total", "fail", "tokens", "throughput", "p95 latency", "p95 TTFT")
+	fmt.Printf("  %-28s %-12s %-10s %-6s %-10s %-13s %-12s %-12s %-13s %-10s\n",
+		"model", "mode", "ok/total", "fail", "tokens", "throughput", "avg thread", "best thread", "p95 latency", "p95 TTFT")
 	for _, s := range stats {
 		ttft := "-"
 		if s.Stream && s.TTFTStat.Count > 0 {
@@ -91,13 +93,15 @@ func PrintModelSummary(stats []Stats) {
 		} else {
 			mode = term.Green(mode)
 		}
-		fmt.Printf("  %-28s %s %-10s %-6d %-10s %-13s %-13s %-10s\n",
+		fmt.Printf("  %-28s %s %-10s %-6d %-10s %-13s %-12s %-12s %-13s %-10s\n",
 			trunc(s.Model, 28),
 			mode,
 			fmt.Sprintf("%d/%d", s.Success, s.Total),
 			s.Failed,
 			intFmt(s.CompletionTokens),
 			fmt.Sprintf("%.2f/s", s.TotalThroughput),
+			fmt.Sprintf("%.2f/s", s.AvgThreadTPS),
+			fmt.Sprintf("%.2f/s", s.BestThreadTPS),
 			dur(s.TotalLatency.P95),
 			ttft)
 	}
@@ -111,8 +115,8 @@ func PrintStaircaseModelSummary(results []StaircaseResult) {
 	}
 	fmt.Println()
 	printBoxTitle("Model Staircase Summary")
-	fmt.Printf("  %-28s %-12s %-6s %-8s %-10s %-13s %-13s %-10s\n",
-		"model", "mode", "level", "threads", "ok/total", "throughput", "p95 latency", "fail")
+	fmt.Printf("  %-28s %-12s %-6s %-8s %-10s %-13s %-12s %-12s %-13s %-10s\n",
+		"model", "mode", "level", "threads", "ok/total", "throughput", "avg thread", "best thread", "p95 latency", "fail")
 	for _, r := range results {
 		s := r.Stats
 		failRate := 0.0
@@ -125,13 +129,15 @@ func PrintStaircaseModelSummary(results []StaircaseResult) {
 		} else {
 			mode = term.Green(mode)
 		}
-		fmt.Printf("  %-28s %s %-6d %-8d %-10s %-13s %-13s %-10s\n",
+		fmt.Printf("  %-28s %s %-6d %-8d %-10s %-13s %-12s %-12s %-13s %-10s\n",
 			trunc(s.Model, 28),
 			mode,
 			r.Level,
 			r.Concurrency,
 			fmt.Sprintf("%d/%d", s.Success, s.Total),
 			fmt.Sprintf("%.2f/s", s.TotalThroughput),
+			fmt.Sprintf("%.2f/s", s.AvgThreadTPS),
+			fmt.Sprintf("%.2f/s", s.BestThreadTPS),
 			dur(s.TotalLatency.P95),
 			fmt.Sprintf("%.1f%%", failRate))
 	}
@@ -155,6 +161,8 @@ func printResultBlock(s Stats) {
 	fmt.Printf("  %-12s %s\n", "success", successRateLabel(s))
 	fmt.Printf("  %-12s %s\n", "wall time", dur(s.WallTime))
 	fmt.Printf("  %-12s %s\n", "throughput", term.Bold(fmt.Sprintf("%.2f tok/s", s.TotalThroughput)))
+	fmt.Printf("  %-12s %s\n", "avg thread", fmt.Sprintf("%.2f tok/s", s.AvgThreadTPS))
+	fmt.Printf("  %-12s %s\n", "best thread", fmt.Sprintf("%.2f tok/s", s.BestThreadTPS))
 	fmt.Printf("  %-12s %s\n", "tokens", intFmt(s.CompletionTokens))
 	if s.PromptTokens > 0 {
 		fmt.Printf("  %-12s %s\n", "prompt tok", intFmt(s.PromptTokens))
@@ -197,7 +205,7 @@ func printWorkersBlock(s Stats) {
 	}
 	fmt.Printf("  %-5s %5d %5d %6s %9s %9.2f\n",
 		"all", sumWorkerCount(s.Workers), sumWorkerOK(s.Workers),
-		fail, intFmt(sumWorkerTokens(s.Workers)), avgWorkerTPS(s.Workers))
+		fail, intFmt(sumWorkerTokens(s.Workers)), s.AvgThreadTPS)
 }
 
 func printErrorsBlock(s Stats) {
@@ -556,20 +564,4 @@ func sumWorkerTokens(ws []WorkerStat) int {
 		n += w.CompletionTokens
 	}
 	return n
-}
-func avgWorkerTPS(ws []WorkerStat) float64 {
-	if len(ws) == 0 {
-		return 0
-	}
-	// 总吞吐 = 总 token / 总工作时间
-	var tokens int
-	var busy time.Duration
-	for _, w := range ws {
-		tokens += w.CompletionTokens
-		busy += w.WallTime
-	}
-	if busy <= 0 {
-		return 0
-	}
-	return float64(tokens) / busy.Seconds()
 }

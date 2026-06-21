@@ -18,7 +18,7 @@ import (
 const (
 	defaultPrompt = "Write a continuous original story in English about a developer load-testing a new language model at midnight. Keep it around 350 words, use plain paragraphs, and do not use markdown or bullet lists."
 
-	defaultRequests    = 50
+	defaultRequests    = 32
 	defaultMaxTokens   = 512
 	defaultTemperature = 0.0
 	probeMaxTokens     = 64
@@ -31,6 +31,7 @@ type cliOptions struct {
 	concurrency int
 	requests    int
 	profileName string
+	baseURL     string
 	models      []string
 }
 
@@ -60,21 +61,27 @@ func parseFlags() cliOptions {
 	flag.IntVar(&opts.concurrency, "t", 0, "固定并发线程数；设置后不进入交互选择，直接跑固定并发")
 	flag.IntVar(&opts.requests, "n", defaultRequests, "总请求数；固定并发为总量，交互阶梯扫描为每档请求数")
 	flag.StringVar(&opts.profileName, "profile", "", "使用指定 profile 名称")
+	flag.StringVar(&opts.baseURL, "url", "", "临时 Base URL；可传 host、/v1，或完整 /v1/chat/completions")
 	var modelFlags modelFlag
 	flag.Var(&modelFlags, "model", "使用指定模型 ID；多个模型可用逗号分隔或重复传入")
 	profileShort := flag.String("p", "", "使用指定 profile 名称（简写）")
+	urlShort := flag.String("u", "", "临时 Base URL（简写）；不写入 config.json")
 	flag.Var(&modelFlags, "m", "使用指定模型 ID（简写）；多个模型可用逗号分隔或重复传入")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "用法:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s                  交互选择 provider/model，默认跑阶梯扫描\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s -t 8 -n 50       使用默认 profile 和上次模型，直接跑固定并发\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2 -t 8 -n 50\n\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2,kimi-2.6 -t 8 -n 50\n\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -t 8 -n 32       使用默认 profile 和上次模型，直接跑固定并发\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2 -t 8 -n 32\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -u https://api.example.com/v1/chat/completions -m glm-5.2 -t 8 -n 32\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2,kimi-2.6 -t 8 -n 32\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	if *profileShort != "" {
 		opts.profileName = *profileShort
+	}
+	if *urlShort != "" {
+		opts.baseURL = *urlShort
 	}
 	opts.models = modelFlags.Models()
 	if flag.NArg() > 0 {
@@ -91,7 +98,9 @@ func parseFlags() cliOptions {
 
 func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 	profile := selectProfile(cfg)
+	profile.BaseURL = mustNormalizeBaseURL(profile.BaseURL)
 	cfg.SetDefault(profile.Name)
+	cfg.AddProfile(profile)
 	if err := cfg.Save(); err != nil {
 		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
@@ -118,8 +127,10 @@ func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 }
 
 func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
-	profile := selectProfileFromFlags(cfg, opts.profileName)
-	cfg.SetDefault(profile.Name)
+	profile := selectProfileFromFlags(cfg, opts.profileName, opts.baseURL)
+	if opts.baseURL == "" {
+		cfg.SetDefault(profile.Name)
+	}
 	printProvider(profile)
 
 	models := opts.models
@@ -130,9 +141,11 @@ func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
 		die("参数模式缺少模型：请加 -m <model>，或先运行一次交互模式选择模型以记录 last_model")
 	}
 
-	cfg.SetLastModel(profile.Name, strings.Join(models, ","))
-	if err := cfg.Save(); err != nil {
-		fmt.Printf("保存 config.json 失败: %v\n", err)
+	if opts.baseURL == "" {
+		cfg.SetLastModel(profile.Name, strings.Join(models, ","))
+		if err := cfg.Save(); err != nil {
+			fmt.Printf("保存 config.json 失败: %v\n", err)
+		}
 	}
 
 	printModels(models)
@@ -175,6 +188,7 @@ func createProfile(cfg *config.File) config.Profile {
 		fmt.Println("  Base URL 不能为空")
 		baseURL = ui.Prompt("Base URL", "")
 	}
+	baseURL = mustNormalizeBaseURL(baseURL)
 	apiKey := ui.Prompt("API Key (可留空，用于本地无鉴权部署)", "")
 	p := config.Profile{Name: name, BaseURL: baseURL, APIKey: apiKey}
 	cfg.AddProfile(p)
@@ -229,19 +243,50 @@ func (m *modelFlag) Models() []string {
 	return dedupeStrings(m.values)
 }
 
-func selectProfileFromFlags(cfg *config.File, name string) config.Profile {
+func selectProfileFromFlags(cfg *config.File, name, baseURL string) config.Profile {
+	if baseURL != "" {
+		apiKey := strings.TrimSpace(os.Getenv("LLM_PRESSURE_API_KEY"))
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		}
+		lastModel := ""
+		if name != "" {
+			p, ok := cfg.Find(name)
+			if !ok {
+				die("未找到 profile %q，请先运行交互模式创建，或检查 config.json", name)
+			}
+			apiKey = p.APIKey
+			lastModel = p.LastModel
+		}
+		return config.Profile{
+			Name:      "direct-url",
+			BaseURL:   mustNormalizeBaseURL(baseURL),
+			APIKey:    apiKey,
+			LastModel: lastModel,
+		}
+	}
 	if name != "" {
 		p, ok := cfg.Find(name)
 		if !ok {
 			die("未找到 profile %q，请先运行交互模式创建，或检查 config.json", name)
 		}
+		p.BaseURL = mustNormalizeBaseURL(p.BaseURL)
 		return p
 	}
 	if p, ok := cfg.DefaultProfile(); ok {
+		p.BaseURL = mustNormalizeBaseURL(p.BaseURL)
 		return p
 	}
 	die("未发现 profile：请先运行 ./llm_pressure 创建 provider 配置")
 	return config.Profile{}
+}
+
+func mustNormalizeBaseURL(raw string) string {
+	baseURL, err := api.NormalizeBaseURL(raw)
+	if err != nil {
+		die("%v", err)
+	}
+	return baseURL
 }
 
 func defaultChatRequest(model string) api.ChatRequest {
