@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -12,54 +14,141 @@ import (
 	"llm_pressure/ui"
 )
 
-const defaultPrompt = "Write a short essay about the history of computing, covering the key milestones from mechanical calculators to modern AI."
+const (
+	defaultPrompt = "Write a continuous original story in English about a developer load-testing a new language model at midnight. Keep it around 350 words, use plain paragraphs, and do not use markdown or bullet lists."
+
+	defaultRequests    = 50
+	defaultMaxTokens   = 512
+	defaultTemperature = 0.0
+	probeMaxTokens     = 64
+	probeTimeout       = 90 * time.Second
+)
+
+var defaultStairLevels = []int{1, 2, 4, 8, 16}
+
+type cliOptions struct {
+	concurrency int
+	requests    int
+	profileName string
+	model       string
+}
 
 func main() {
+	opts := parseFlags()
+
 	fmt.Println("╔══════════════════════════════════════════╗")
 	fmt.Println("║       LLM Chat Completion 压力测试       ║")
 	fmt.Println("╚══════════════════════════════════════════╝")
 
-	// 1. 加载/新建配置
 	cfg, err := config.Load()
 	if err != nil {
 		die("加载配置失败: %v", err)
 	}
 
-	// 2. 选择 profile
+	ctx, cancel := runner.InstallSignalHandler()
+	defer cancel()
+
+	if opts.concurrency > 0 {
+		runFromFlags(ctx, cfg, opts)
+		return
+	}
+
+	runInteractive(ctx, cfg, opts)
+}
+
+func parseFlags() cliOptions {
+	var opts cliOptions
+	flag.IntVar(&opts.concurrency, "t", 0, "固定并发线程数；设置后不进入交互选择，直接跑固定并发")
+	flag.IntVar(&opts.requests, "n", defaultRequests, "总请求数；固定并发为总量，交互阶梯扫描为每档请求数")
+	flag.StringVar(&opts.profileName, "profile", "", "使用指定 profile 名称")
+	flag.StringVar(&opts.model, "model", "", "使用指定模型 ID")
+	profileShort := flag.String("p", "", "使用指定 profile 名称（简写）")
+	modelShort := flag.String("m", "", "使用指定模型 ID（简写）")
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "用法:\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s                  交互选择 provider/model，默认跑阶梯扫描\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -t 8 -n 50       使用默认 profile 和上次模型，直接跑固定并发\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2 -t 8 -n 50\n\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if *profileShort != "" {
+		opts.profileName = *profileShort
+	}
+	if *modelShort != "" {
+		opts.model = *modelShort
+	}
+	if flag.NArg() > 0 {
+		die("不支持的位置参数: %s", strings.Join(flag.Args(), " "))
+	}
+	if opts.concurrency < 0 {
+		die("-t 必须大于 0")
+	}
+	if opts.requests <= 0 {
+		die("-n 必须大于 0")
+	}
+	return opts
+}
+
+func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 	profile := selectProfile(cfg)
+	cfg.SetDefault(profile.Name)
 	if err := cfg.Save(); err != nil {
-		fmt.Printf("⚠ 保存 config.json 失败: %v\n", err)
+		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
 	fmt.Printf("\n使用 profile: %s\n  base_url: %s\n", profile.Name, profile.BaseURL)
 
 	client := api.New(profile.BaseURL, profile.APIKey)
 
-	// 3. 查询并选择 model
-	ctx, cancel := runner.InstallSignalHandler()
-	defer cancel()
-
 	model := selectModel(ctx, client)
+	if model == "" {
+		die("模型 ID 不能为空")
+	}
+	cfg.SetLastModel(profile.Name, model)
+	if err := cfg.Save(); err != nil {
+		fmt.Printf("保存 config.json 失败: %v\n", err)
+	}
 	fmt.Printf("\n已选模型: %s\n", model)
 
-	// 4. 选择测试参数
-	params := collectParams()
+	params := testParams{
+		requests:    int64(opts.requests),
+		stairLevels: append([]int(nil), defaultStairLevels...),
+	}
+	req := defaultChatRequest(model)
 
-	// 5. 选择模式
-	mode := selectMode()
+	printBuiltinSettings("交互模式: 默认阶梯扫描", fmt.Sprintf("档位=%v  每档请求=%d", params.stairLevels, params.requests))
+	runStaircaseAuto(ctx, client, req, params, model)
+}
 
-	req := api.ChatRequest{
-		Model:       model,
-		Messages:    []api.Message{{Role: "user", Content: params.prompt}},
-		MaxTokens:   params.maxTokens,
-		Temperature: params.temperature,
+func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
+	profile := selectProfileFromFlags(cfg, opts.profileName)
+	cfg.SetDefault(profile.Name)
+	fmt.Printf("\n使用 profile: %s\n  base_url: %s\n", profile.Name, profile.BaseURL)
+
+	model := opts.model
+	if model == "" {
+		model = profile.LastModel
+	}
+	if model == "" {
+		die("参数模式缺少模型：请加 -m <model>，或先运行一次交互模式选择模型以记录 last_model")
 	}
 
-	// 6. 执行
-	if mode == "fixed" {
-		runFixed(ctx, client, req, params, model)
-	} else {
-		runStaircase(ctx, client, req, params, model)
+	cfg.SetLastModel(profile.Name, model)
+	if err := cfg.Save(); err != nil {
+		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
+
+	fmt.Printf("\n已选模型: %s\n", model)
+
+	client := api.New(profile.BaseURL, profile.APIKey)
+	params := testParams{
+		concurrency: opts.concurrency,
+		requests:    int64(opts.requests),
+	}
+	req := defaultChatRequest(model)
+
+	printBuiltinSettings("参数模式: 固定并发", fmt.Sprintf("并发=%d  总请求=%d", params.concurrency, params.requests))
+	runFixedAuto(ctx, client, req, params, model)
 }
 
 // ---- 流程步骤 ----
@@ -114,103 +203,104 @@ func selectModel(ctx context.Context, client *api.Client) string {
 		desc := m.OwnedBy
 		opts[i] = ui.SelectOption{Label: m.ID, Desc: desc}
 	}
-	// 支持模糊筛选：先问是否要筛选
-	filter := ui.Prompt("\n可选：输入关键字筛选模型（回车跳过）", "")
-	if filter != "" {
-		filtered := make([]ui.SelectOption, 0)
-		for _, o := range opts {
-			if strings.Contains(strings.ToLower(o.Label), strings.ToLower(filter)) {
-				filtered = append(filtered, o)
-			}
-		}
-		if len(filtered) > 0 {
-			opts = filtered
-		} else {
-			fmt.Println("  没有匹配的模型，使用完整列表。")
-		}
-	}
 	idx, _ := ui.Select(fmt.Sprintf("选择模型（共 %d 个）：", len(opts)), opts, false)
 	return opts[idx].Label
 }
 
 type testParams struct {
-	prompt      string
-	maxTokens   int
-	temperature float64
 	concurrency int
 	requests    int64
-	duration    time.Duration
 	stairLevels []int
 }
 
-func collectParams() testParams {
-	fmt.Println("\n--- 测试参数 ---")
-	p := testParams{
-		prompt:      ui.Prompt("Prompt", defaultPrompt),
-		maxTokens:   ui.PromptInt("max_tokens", 256),
-		temperature: ui.PromptFloat("temperature", 0.0),
+func selectProfileFromFlags(cfg *config.File, name string) config.Profile {
+	if name != "" {
+		p, ok := cfg.Find(name)
+		if !ok {
+			die("未找到 profile %q，请先运行交互模式创建，或检查 config.json", name)
+		}
+		return p
 	}
-	p.concurrency = ui.PromptInt("并发数 N (1=单线程)", 8)
-
-	stopMode, _ := ui.Select("停止条件：", []ui.SelectOption{
-		{Label: "按总请求数", Desc: "完成 N 个请求后停止"},
-		{Label: "按总时长", Desc: "跑满 T 秒后停止"},
-	}, false)
-	if stopMode == 0 {
-		p.requests = int64(ui.PromptInt("总请求数", 50))
-		p.duration = 0
-	} else {
-		p.duration = time.Duration(ui.PromptInt("总时长(秒)", 30)) * time.Second
-		p.requests = 0
+	if p, ok := cfg.DefaultProfile(); ok {
+		return p
 	}
-
-	// 阶梯扫描的档位（即便选固定模式也问一下，便于复用）
-	if ui.Confirm("是否自定义阶梯扫描的并发档位？（否则用默认 1,2,4,8,16）", false) {
-		s := ui.Prompt("并发档位（逗号分隔，例如 1,2,4,8,16,32）", "1,2,4,8,16")
-		p.stairLevels = parseLevels(s)
-	} else {
-		p.stairLevels = []int{1, 2, 4, 8, 16}
-	}
-	return p
+	die("未发现 profile：请先运行 ./llm_pressure 创建 provider 配置")
+	return config.Profile{}
 }
 
-func parseLevels(s string) []int {
-	parts := strings.Split(s, ",")
-	out := make([]int, 0, len(parts))
-	for _, x := range parts {
-		x = strings.TrimSpace(x)
-		if x == "" {
+func defaultChatRequest(model string) api.ChatRequest {
+	return api.ChatRequest{
+		Model:       model,
+		Messages:    []api.Message{{Role: "user", Content: defaultPrompt}},
+		MaxTokens:   defaultMaxTokens,
+		Temperature: defaultTemperature,
+	}
+}
+
+func printBuiltinSettings(mode, detail string) {
+	fmt.Printf("\n%s\n", mode)
+	fmt.Printf("内置请求参数: max_tokens=%d  temperature=%.1f  prompt=内置故事生成\n", defaultMaxTokens, defaultTemperature)
+	fmt.Printf("%s\n", detail)
+	fmt.Println("流式/非流式将自动检测；可用的模式都会执行，不可用的会跳过。")
+}
+
+func runFixedAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
+	modes := detectSupportedModes(ctx, client, req)
+	for _, stream := range modes {
+		if ctx.Err() != nil {
+			return
+		}
+		runFixed(ctx, client, req, p, model, stream)
+	}
+}
+
+func runStaircaseAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
+	modes := detectSupportedModes(ctx, client, req)
+	for _, stream := range modes {
+		if ctx.Err() != nil {
+			return
+		}
+		runStaircase(ctx, client, req, p, model, stream)
+	}
+}
+
+func detectSupportedModes(ctx context.Context, client *api.Client, req api.ChatRequest) []bool {
+	fmt.Println("\n正在检测请求模式...")
+	probeReq := req
+	probeReq.Messages = []api.Message{{Role: "user", Content: "Reply with one short sentence."}}
+	probeReq.MaxTokens = probeMaxTokens
+
+	candidates := []bool{false, true}
+	supported := make([]bool, 0, len(candidates))
+	for _, stream := range candidates {
+		if ctx.Err() != nil {
+			return supported
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		var r api.Result
+		if stream {
+			r = client.ChatStream(probeCtx, probeReq)
+		} else {
+			r = client.Chat(probeCtx, probeReq)
+		}
+		cancel()
+		if r.Err != nil {
+			fmt.Printf("  跳过 %s: %s\n", streamLabel(stream), compactForLine(r.Err.Error(), 180))
 			continue
 		}
-		var n int
-		fmt.Sscanf(x, "%d", &n)
-		if n > 0 {
-			out = append(out, n)
-		}
+		fmt.Printf("  可用 %s\n", streamLabel(stream))
+		supported = append(supported, stream)
 	}
-	if len(out) == 0 {
-		return []int{1, 2, 4, 8, 16}
+	if len(supported) == 0 {
+		fmt.Println("\n没有可用的请求模式，压测已跳过。")
 	}
-	return out
+	return supported
 }
 
-func selectMode() string {
-	idx, _ := ui.Select("选择测试模式：", []ui.SelectOption{
-		{Label: "固定并发", Desc: "以 N 个线程持续发请求"},
-		{Label: "阶梯扫描", Desc: "依次跑 1,2,4,8,16... 并发，输出对比表"},
-	}, false)
-	if idx == 0 {
-		return "fixed"
-	}
-	return "staircase"
-}
-
-func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
-	// 同时跑流式和非流式
-	stream := ui.Confirm("\n使用流式 (stream:true)？(否=非流式)", true)
-
-	progressCb := makeProgressCB(p.concurrency)
-	fmt.Printf("\n开始压测：并发=%d  模型=%s  %s\n", p.concurrency, model, streamLabel(stream))
+func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) {
+	progressCb := makeProgressCB()
+	fmt.Printf("\n开始固定并发：并发=%d  总请求=%d  模型=%s  %s\n",
+		p.concurrency, p.requests, model, streamLabel(stream))
 
 	stats, samples := runner.RunFixed(ctx, runner.RunConfig{
 		Client:      client,
@@ -218,7 +308,6 @@ func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p te
 		Stream:      stream,
 		Concurrency: p.concurrency,
 		Requests:    p.requests,
-		Duration:    p.duration,
 		Model:       model,
 		OnProgress:  progressCb,
 	})
@@ -230,6 +319,7 @@ func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p te
 		Model:     model,
 		Stream:    stream,
 		Mode:      "fixed",
+		Request:   reportRequestFrom(req),
 		Fixed:     &stats,
 	}
 	if path, err := runner.SaveReport(rep); err == nil {
@@ -240,19 +330,12 @@ func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p te
 	}
 }
 
-func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
-	stream := ui.Confirm("\n使用流式 (stream:true)？(否=非流式)", true)
-
-	// 阶梯扫描时，每档使用用户设的「单档请求数」或「单档时长」
-	// 用户输入的 p.requests / p.duration 视作「每档」
+func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) {
 	perLevelRequests := p.requests
-	perLevelDuration := p.duration
-	if perLevelRequests == 0 && perLevelDuration == 0 {
-		perLevelDuration = 20 * time.Second
-	}
 
-	progressCb := makeProgressCB(0)
-	fmt.Printf("\n开始阶梯扫描：档位=%v  模型=%s  %s\n", p.stairLevels, model, streamLabel(stream))
+	progressCb := makeProgressCB()
+	fmt.Printf("\n开始阶梯扫描：档位=%v  每档请求=%d  模型=%s  %s\n",
+		p.stairLevels, perLevelRequests, model, streamLabel(stream))
 
 	results := runner.RunStaircase(ctx, runner.StaircaseConfig{
 		Client:           client,
@@ -260,7 +343,6 @@ func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, 
 		Stream:           stream,
 		Levels:           p.stairLevels,
 		RequestsPerLevel: perLevelRequests,
-		DurationPerLevel: perLevelDuration,
 		CoolDown:         3 * time.Second,
 		Model:            model,
 		OnLevelStart: func(level, conc int) {
@@ -276,6 +358,7 @@ func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, 
 		Model:     model,
 		Stream:    stream,
 		Mode:      "staircase",
+		Request:   reportRequestFrom(req),
 		Staircase: results,
 	}
 	if path, err := runner.SaveReport(rep); err == nil {
@@ -285,7 +368,7 @@ func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, 
 	}
 }
 
-func makeProgressCB(conc int) func(runner.Progress) {
+func makeProgressCB() func(runner.Progress) {
 	lastLen := 0
 	return func(p runner.Progress) {
 		line := fmt.Sprintf("  进度: 已完成 %d  成功 %d  失败 %d  累计 token %d",
@@ -300,6 +383,25 @@ func makeProgressCB(conc int) func(runner.Progress) {
 	}
 }
 
+func compactForLine(s string, maxLen int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if maxLen > 0 && len(s) > maxLen {
+		return s[:maxLen-3] + "..."
+	}
+	return s
+}
+
+func reportRequestFrom(req api.ChatRequest) runner.ReportRequest {
+	out := runner.ReportRequest{
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+	}
+	if len(req.Messages) > 0 {
+		out.Prompt = req.Messages[0].Content
+	}
+	return out
+}
+
 func streamLabel(s bool) string {
 	if s {
 		return "[流式]"
@@ -309,4 +411,5 @@ func streamLabel(s bool) string {
 
 func die(format string, args ...any) {
 	fmt.Printf(format+"\n", args...)
+	os.Exit(1)
 }

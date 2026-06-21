@@ -9,9 +9,10 @@ import (
 
 // Profile 是一组 base url + api key 的命名配置
 type Profile struct {
-	Name    string `json:"name"`
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
+	Name      string `json:"name"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	LastModel string `json:"last_model,omitempty"`
 }
 
 // File 是 config.json 的根结构
@@ -74,6 +75,41 @@ func (f *File) AddProfile(p Profile) {
 		f.Profiles = append(f.Profiles, p)
 	}
 	f.Default = p.Name
+}
+
+// DefaultProfile 返回当前默认 profile；若 default 字段为空或失效，则返回第一个 profile。
+func (f *File) DefaultProfile() (Profile, bool) {
+	if f.Default != "" {
+		if p, ok := f.Find(f.Default); ok {
+			return p, true
+		}
+	}
+	if len(f.Profiles) > 0 {
+		return f.Profiles[0], true
+	}
+	return Profile{}, false
+}
+
+// SetDefault 将已存在的 profile 设为默认。
+func (f *File) SetDefault(name string) bool {
+	for _, p := range f.Profiles {
+		if p.Name == name {
+			f.Default = name
+			return true
+		}
+	}
+	return false
+}
+
+// SetLastModel 记录某个 profile 最近使用过的模型，便于参数模式直接运行。
+func (f *File) SetLastModel(profileName, model string) bool {
+	for i, p := range f.Profiles {
+		if p.Name == profileName {
+			f.Profiles[i].LastModel = model
+			return true
+		}
+	}
+	return false
 }
 
 // Find 按名字查找 profile

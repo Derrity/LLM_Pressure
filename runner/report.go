@@ -5,18 +5,27 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
 
 // 保存到磁盘的报告结构
 type Report struct {
-	Timestamp   string             `json:"timestamp"`
-	Model       string             `json:"model"`
-	Stream      bool               `json:"stream"`
-	Mode        string             `json:"mode"`
-	Fixed       *Stats             `json:"fixed,omitempty"`
-	Staircase   []StaircaseResult  `json:"staircase,omitempty"`
+	Timestamp string            `json:"timestamp"`
+	Model     string            `json:"model"`
+	Stream    bool              `json:"stream"`
+	Mode      string            `json:"mode"`
+	Request   ReportRequest     `json:"request"`
+	Fixed     *Stats            `json:"fixed,omitempty"`
+	Staircase []StaircaseResult `json:"staircase,omitempty"`
+}
+
+// ReportRequest 记录本次压测使用的内置请求参数。
+type ReportRequest struct {
+	Prompt      string  `json:"prompt,omitempty"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
+	Temperature float64 `json:"temperature"`
 }
 
 // PrintFixed 打印单次固定并发压测的统计
@@ -61,10 +70,21 @@ func PrintFixed(s Stats) {
 	// 错误分布
 	if len(s.ErrorDist) > 0 {
 		fmt.Println("  错误分布:")
-		for msg, n := range s.ErrorDist {
+		items := sortedErrors(s.ErrorDist)
+		const maxErrors = 8
+		for i, item := range items {
+			if i >= maxErrors {
+				remaining := 0
+				for _, rest := range items[i:] {
+					remaining += rest.Count
+				}
+				fmt.Printf("    ... 另有 %d 条错误样本，详见 JSON 报告\n", remaining)
+				break
+			}
+			msg, n := item.Message, item.Count
 			short := msg
-			if len(short) > 80 {
-				short = short[:77] + "..."
+			if len(short) > 180 {
+				short = short[:177] + "..."
 			}
 			fmt.Printf("    [%d] %s\n", n, short)
 		}
@@ -111,7 +131,7 @@ func SaveReport(rep Report) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("%s_%s.json", rep.Timestamp, rep.Mode)
+	name := fmt.Sprintf("%s_%s_%s.json", rep.Timestamp, rep.Mode, reportStreamName(rep.Stream))
 	path := filepath.Join(dir, name)
 	f, err := os.Create(path)
 	if err != nil {
@@ -127,6 +147,32 @@ func SaveReport(rep Report) (string, error) {
 }
 
 // ---- helpers ----
+
+type errorItem struct {
+	Message string
+	Count   int
+}
+
+func sortedErrors(dist map[string]int) []errorItem {
+	items := make([]errorItem, 0, len(dist))
+	for msg, count := range dist {
+		items = append(items, errorItem{Message: msg, Count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Count == items[j].Count {
+			return items[i].Message < items[j].Message
+		}
+		return items[i].Count > items[j].Count
+	})
+	return items
+}
+
+func reportStreamName(stream bool) string {
+	if stream {
+		return "stream"
+	}
+	return "nonstream"
+}
 
 func printLatencyRow(label string, ls LatencyStat, isTPS bool) {
 	if ls.Count == 0 {

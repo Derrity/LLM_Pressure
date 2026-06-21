@@ -54,7 +54,7 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list models: HTTP %d: %s", resp.StatusCode, slurpErr(resp.Body))
+		return nil, fmt.Errorf("list models: %s", httpError(resp.StatusCode, slurpErr(resp.Body)))
 	}
 	var out listModelsResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -67,8 +67,8 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 // Delta 字段在流式响应里复用此结构；ReasoningContent 用于推理模型
 // (如 GLM-4.7 / DeepSeek-R1)，其思考过程通过 reasoning_content 流出
 type Message struct {
-	Role            string `json:"role,omitempty"`
-	Content         string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
@@ -78,7 +78,7 @@ type ChatRequest struct {
 	Messages    []Message `json:"messages"`
 	Stream      bool      `json:"stream,omitempty"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
+	Temperature float64   `json:"temperature"`
 }
 
 // usage 是响应里的 token 用量
@@ -143,7 +143,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) Result {
 	r.HTTPStatus = resp.StatusCode
 
 	if resp.StatusCode != http.StatusOK {
-		r.Err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, slurpErr(resp.Body))
+		r.Err = errors.New(httpError(resp.StatusCode, slurpErr(resp.Body)))
 		return r
 	}
 
@@ -201,7 +201,7 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest) Result {
 
 	if resp.StatusCode != http.StatusOK {
 		r.TotalLatency = time.Since(start)
-		r.Err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, slurpErr(resp.Body))
+		r.Err = errors.New(httpError(resp.StatusCode, slurpErr(resp.Body)))
 		return r
 	}
 
@@ -293,6 +293,160 @@ func estimateTokens(s string) int {
 }
 
 func slurpErr(r io.Reader) string {
-	b, _ := io.ReadAll(io.LimitReader(r, 1024))
+	b, _ := io.ReadAll(io.LimitReader(r, 16*1024))
 	return strings.TrimSpace(string(b))
+}
+
+func httpError(status int, body string) string {
+	return fmt.Sprintf("HTTP %d: %s", status, summarizeErrorBody(body))
+}
+
+func summarizeErrorBody(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "empty response body"
+	}
+
+	msg, typ, code := parseErrorJSON(body)
+	if msg == "" {
+		return compactWhitespace(body, 600)
+	}
+
+	if inner := extractJSONObject(msg); inner != "" {
+		innerMsg, innerType, innerCode := parseErrorJSON(inner)
+		if innerMsg != "" {
+			msg = innerMsg
+			if typ == "" {
+				typ = innerType
+			}
+			if code == "" {
+				code = innerCode
+			}
+		}
+	}
+
+	msg = compactWhitespace(stripTrailingRequestID(msg), 500)
+	meta := make([]string, 0, 2)
+	if typ != "" {
+		meta = append(meta, "type="+typ)
+	}
+	if code != "" {
+		meta = append(meta, "code="+code)
+	}
+	if len(meta) > 0 {
+		return msg + " (" + strings.Join(meta, ", ") + ")"
+	}
+	return msg
+}
+
+func parseErrorJSON(raw string) (message, typ, code string) {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(raw), &root); err != nil {
+		return "", "", ""
+	}
+
+	if errObj, ok := root["error"].(map[string]any); ok {
+		return stringField(errObj, "message"), stringField(errObj, "type"), valueString(errObj["code"])
+	}
+
+	if errorsList, ok := root["errors"].([]any); ok && len(errorsList) > 0 {
+		if first, ok := errorsList[0].(map[string]any); ok {
+			return stringField(first, "message"), stringField(first, "type"), valueString(first["code"])
+		}
+	}
+
+	return stringField(root, "message"), stringField(root, "type"), valueString(root["code"])
+}
+
+func stringField(m map[string]any, key string) string {
+	v, _ := m[key].(string)
+	return v
+}
+
+func valueString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case float64:
+		return fmt.Sprintf("%.0f", x)
+	case bool:
+		return fmt.Sprintf("%t", x)
+	default:
+		return fmt.Sprint(x)
+	}
+}
+
+func extractJSONObject(s string) string {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+func stripTrailingRequestID(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, ")") {
+		if idx := strings.LastIndex(s, " ("); idx >= 0 {
+			tail := s[idx+2 : len(s)-1]
+			if looksLikeRequestID(tail) {
+				return strings.TrimSpace(s[:idx])
+			}
+		}
+	}
+	return s
+}
+
+func looksLikeRequestID(s string) bool {
+	if len(s) < 16 {
+		return false
+	}
+	for _, r := range s {
+		if (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func compactWhitespace(s string, maxLen int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if maxLen > 0 && len(s) > maxLen {
+		return s[:maxLen-3] + "..."
+	}
+	return s
 }

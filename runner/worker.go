@@ -11,10 +11,10 @@ import (
 
 // progress 在运行期间被原子更新，供 UI 显示实时进度
 type progress struct {
-	done    atomic.Int64
-	ok      atomic.Int64
-	failed  atomic.Int64
-	tokens  atomic.Int64
+	done   atomic.Int64
+	ok     atomic.Int64
+	failed atomic.Int64
+	tokens atomic.Int64
 }
 
 // Progress 是 progress 的只读快照
@@ -124,15 +124,13 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// stopCondition 封装 "总请求数 M" 或 "总时长 T" 两个停止条件之一
-// M > 0 时按请求数停止；否则按 duration 停止
+// stopCondition 封装 worker 请求预算；当前 CLI 只暴露按请求数停止。
 type stopCondition struct {
-	requests  int64
-	duration  time.Duration
+	requests int64
+	duration time.Duration
 }
 
-// budgetFor 返回该停止条件下的初始 budget（用 *atomic.Int64 实现）
-// 若是时长型，budget 设为一个大数（实际靠 ctx 超时停止）
+// budgetFor 返回初始 budget（用 *atomic.Int64 实现）。
 func (sc stopCondition) budgetFor() (*atomic.Int64, context.Context, context.CancelFunc) {
 	budget := &atomic.Int64{}
 	if sc.requests > 0 {
