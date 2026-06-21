@@ -11,6 +11,7 @@ import (
 	"llm_pressure/api"
 	"llm_pressure/config"
 	"llm_pressure/runner"
+	"llm_pressure/term"
 	"llm_pressure/ui"
 )
 
@@ -36,9 +37,7 @@ type cliOptions struct {
 func main() {
 	opts := parseFlags()
 
-	fmt.Println("╔══════════════════════════════════════════╗")
-	fmt.Println("║       LLM Chat Completion 压力测试       ║")
-	fmt.Println("╚══════════════════════════════════════════╝")
+	printAppHeader()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -96,7 +95,7 @@ func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 	if err := cfg.Save(); err != nil {
 		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
-	fmt.Printf("\n使用 profile: %s\n  base_url: %s\n", profile.Name, profile.BaseURL)
+	printProvider(profile)
 
 	client := api.New(profile.BaseURL, profile.APIKey)
 
@@ -108,7 +107,7 @@ func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 	if err := cfg.Save(); err != nil {
 		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
-	fmt.Printf("\n已选模型: %s\n", model)
+	printModel(model)
 
 	params := testParams{
 		requests:    int64(opts.requests),
@@ -116,14 +115,14 @@ func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 	}
 	req := defaultChatRequest(model)
 
-	printBuiltinSettings("交互模式: 默认阶梯扫描", fmt.Sprintf("档位=%v  每档请求=%d", params.stairLevels, params.requests))
+	printBuiltinSettings("staircase", fmt.Sprintf("levels=%v  requests/level=%d", params.stairLevels, params.requests))
 	runStaircaseAuto(ctx, client, req, params, model)
 }
 
 func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
 	profile := selectProfileFromFlags(cfg, opts.profileName)
 	cfg.SetDefault(profile.Name)
-	fmt.Printf("\n使用 profile: %s\n  base_url: %s\n", profile.Name, profile.BaseURL)
+	printProvider(profile)
 
 	model := opts.model
 	if model == "" {
@@ -138,7 +137,7 @@ func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
 		fmt.Printf("保存 config.json 失败: %v\n", err)
 	}
 
-	fmt.Printf("\n已选模型: %s\n", model)
+	printModel(model)
 
 	client := api.New(profile.BaseURL, profile.APIKey)
 	params := testParams{
@@ -147,7 +146,7 @@ func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
 	}
 	req := defaultChatRequest(model)
 
-	printBuiltinSettings("参数模式: 固定并发", fmt.Sprintf("并发=%d  总请求=%d", params.concurrency, params.requests))
+	printBuiltinSettings("fixed concurrency", fmt.Sprintf("threads=%d  requests=%d", params.concurrency, params.requests))
 	runFixedAuto(ctx, client, req, params, model)
 }
 
@@ -238,20 +237,25 @@ func defaultChatRequest(model string) api.ChatRequest {
 }
 
 func printBuiltinSettings(mode, detail string) {
-	fmt.Printf("\n%s\n", mode)
-	fmt.Printf("内置请求参数: max_tokens=%d  temperature=%.1f  prompt=内置故事生成\n", defaultMaxTokens, defaultTemperature)
-	fmt.Printf("%s\n", detail)
-	fmt.Println("流式/非流式将自动检测；可用的模式都会执行，不可用的会跳过。")
+	fmt.Println()
+	fmt.Printf("%s %s\n", colorLabel("Preset", 11), mode)
+	fmt.Printf("%s max=%d  temperature=%.1f\n", colorLabel("Tokens", 11), defaultMaxTokens, defaultTemperature)
+	fmt.Printf("%s %s\n", colorLabel("Run", 11), detail)
+	fmt.Printf("%s %s\n", colorLabel("Modes", 11), "auto-detect non-stream and stream")
 }
 
 func runFixedAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
 	modes := detectSupportedModes(ctx, client, req)
+	var summaries []runner.Stats
 	for _, stream := range modes {
 		if ctx.Err() != nil {
 			return
 		}
-		runFixed(ctx, client, req, p, model, stream)
+		if stats, ok := runFixed(ctx, client, req, p, model, stream); ok {
+			summaries = append(summaries, stats)
+		}
 	}
+	runner.PrintComparison(summaries)
 }
 
 func runStaircaseAuto(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string) {
@@ -265,7 +269,8 @@ func runStaircaseAuto(ctx context.Context, client *api.Client, req api.ChatReque
 }
 
 func detectSupportedModes(ctx context.Context, client *api.Client, req api.ChatRequest) []bool {
-	fmt.Println("\n正在检测请求模式...")
+	fmt.Println()
+	fmt.Println(term.Cyan("Checking API modes..."))
 	probeReq := req
 	probeReq.Messages = []api.Message{{Role: "user", Content: "Reply with one short sentence."}}
 	probeReq.MaxTokens = probeMaxTokens
@@ -285,10 +290,10 @@ func detectSupportedModes(ctx context.Context, client *api.Client, req api.ChatR
 		}
 		cancel()
 		if r.Err != nil {
-			fmt.Printf("  跳过 %s: %s\n", streamLabel(stream), compactForLine(r.Err.Error(), 180))
+			fmt.Printf("  %s %-11s %s\n", term.Red("x"), modeName(stream), compactForLine(r.Err.Error(), 180))
 			continue
 		}
-		fmt.Printf("  可用 %s\n", streamLabel(stream))
+		fmt.Printf("  %s %-11s available\n", term.Green("✓"), modeName(stream))
 		supported = append(supported, stream)
 	}
 	if len(supported) == 0 {
@@ -297,10 +302,10 @@ func detectSupportedModes(ctx context.Context, client *api.Client, req api.ChatR
 	return supported
 }
 
-func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) {
+func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) (runner.Stats, bool) {
 	progressCb := makeProgressCB()
-	fmt.Printf("\n开始固定并发：并发=%d  总请求=%d  模型=%s  %s\n",
-		p.concurrency, p.requests, model, streamLabel(stream))
+	fmt.Printf("\n%s %s  concurrency=%d  requests=%d\n",
+		term.Cyan("Running"), modeName(stream), p.concurrency, p.requests)
 
 	stats, samples := runner.RunFixed(ctx, runner.RunConfig{
 		Client:      client,
@@ -311,7 +316,7 @@ func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p te
 		Model:       model,
 		OnProgress:  progressCb,
 	})
-	fmt.Println()
+	clearProgressLine()
 	runner.PrintFixed(stats)
 
 	rep := runner.Report{
@@ -323,19 +328,20 @@ func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p te
 		Fixed:     &stats,
 	}
 	if path, err := runner.SaveReport(rep); err == nil {
-		fmt.Printf("\n原始样本已保存: %s  (共 %d 条样本)\n", path, len(samples))
+		fmt.Printf("\n%s %s  (%d samples)\n", term.Gray("Saved"), path, len(samples))
 		_ = samples
 	} else {
 		fmt.Printf("\n保存报告失败: %v\n", err)
 	}
+	return stats, true
 }
 
 func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) {
 	perLevelRequests := p.requests
 
 	progressCb := makeProgressCB()
-	fmt.Printf("\n开始阶梯扫描：档位=%v  每档请求=%d  模型=%s  %s\n",
-		p.stairLevels, perLevelRequests, model, streamLabel(stream))
+	fmt.Printf("\n%s staircase %s  levels=%v  requests/level=%d\n",
+		term.Cyan("Running"), modeName(stream), p.stairLevels, perLevelRequests)
 
 	results := runner.RunStaircase(ctx, runner.StaircaseConfig{
 		Client:           client,
@@ -346,11 +352,11 @@ func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, 
 		CoolDown:         3 * time.Second,
 		Model:            model,
 		OnLevelStart: func(level, conc int) {
-			fmt.Printf("\n>>> 档 %d: 并发 = %d\n", level, conc)
+			fmt.Printf("\n%s level=%d  concurrency=%d\n", term.Cyan("Level"), level, conc)
 		},
 		OnProgress: progressCb,
 	})
-	fmt.Println()
+	clearProgressLine()
 	runner.PrintStaircase(results, stream)
 
 	rep := runner.Report{
@@ -362,18 +368,20 @@ func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, 
 		Staircase: results,
 	}
 	if path, err := runner.SaveReport(rep); err == nil {
-		fmt.Printf("\n报告已保存: %s  (共 %d 档)\n", path, len(results))
+		fmt.Printf("\n%s %s  (%d levels)\n", term.Gray("Saved"), path, len(results))
 	} else {
 		fmt.Printf("\n保存报告失败: %v\n", err)
 	}
 }
 
 func makeProgressCB() func(runner.Progress) {
+	if !term.IsTerminal() {
+		return nil
+	}
 	lastLen := 0
 	return func(p runner.Progress) {
-		line := fmt.Sprintf("  进度: 已完成 %d  成功 %d  失败 %d  累计 token %d",
+		line := fmt.Sprintf("  progress %d done   %d ok   %d failed   %d tok",
 			p.Done, p.OK, p.Failed, p.Tokens)
-		// 用回车覆盖上一行
 		pad := ""
 		if len(line) < lastLen {
 			pad = strings.Repeat(" ", lastLen-len(line))
@@ -381,6 +389,13 @@ func makeProgressCB() func(runner.Progress) {
 		fmt.Printf("\r%s%s", line, pad)
 		lastLen = len(line)
 	}
+}
+
+func clearProgressLine() {
+	if !term.IsTerminal() {
+		return
+	}
+	fmt.Print("\r" + strings.Repeat(" ", 100) + "\r")
 }
 
 func compactForLine(s string, maxLen int) string {
@@ -407,6 +422,36 @@ func streamLabel(s bool) string {
 		return "[流式]"
 	}
 	return "[非流式]"
+}
+
+func modeName(stream bool) string {
+	if stream {
+		return "stream"
+	}
+	return "non-stream"
+}
+
+func printAppHeader() {
+	fmt.Println("╭──────────────────────────────────────────────╮")
+	fmt.Printf("│  %s%s│\n", term.Bold(term.Cyan("LLM Pressure Test")), strings.Repeat(" ", 26))
+	fmt.Println("╰──────────────────────────────────────────────╯")
+}
+
+func printProvider(profile config.Profile) {
+	fmt.Println()
+	fmt.Printf("%s %s\n", colorLabel("Provider", 11), profile.Name)
+	fmt.Printf("%s %s\n", colorLabel("Base URL", 11), profile.BaseURL)
+}
+
+func printModel(model string) {
+	fmt.Printf("%s %s\n", colorLabel("Model", 11), model)
+}
+
+func colorLabel(s string, width int) string {
+	if len(s) < width {
+		s += strings.Repeat(" ", width-len(s))
+	}
+	return term.Cyan(s)
 }
 
 func die(format string, args ...any) {
