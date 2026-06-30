@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -14,14 +15,14 @@ import (
 
 // RunConfig 是单次固定并发压测的配置
 type RunConfig struct {
-	Client      *api.Client
-	Req         api.ChatRequest
-	Stream      bool
-	Concurrency int
-	Requests    int64 // >0：按总请求数停止
-	Duration    time.Duration // Requests==0 时生效
-	Model       string
-	OnProgress  func(Progress) // 可选，周期性回调
+	Client        *api.Client
+	Req           api.ChatRequest
+	Stream        bool
+	Concurrency   int
+	Requests      int64         // >0：按总请求数停止；0 表示不按请求数停止
+	Duration      time.Duration // Requests==0 且 Duration>0 时按时长停止；否则直到 ctx 取消
+	Model         string
+	OnProgress    func(Progress) // 可选，周期性回调
 	ProgressEvery time.Duration
 }
 
@@ -34,8 +35,12 @@ func RunFixed(parent context.Context, cfg RunConfig) (Stats, []Sample) {
 		cfg.ProgressEvery = 500 * time.Millisecond
 	}
 
-	sc := stopCondition{requests: cfg.Requests, duration: cfg.Duration}
-	budget, ctx, cancel := sc.budgetFor()
+	var budget *atomic.Int64
+	if cfg.Requests > 0 {
+		budget = &atomic.Int64{}
+		budget.Store(cfg.Requests)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// 把 parent（可能是 signal ctx）与本次 ctx 合并
@@ -110,16 +115,16 @@ func RunFixed(parent context.Context, cfg RunConfig) (Stats, []Sample) {
 
 // StaircaseConfig 是阶梯扫描的配置
 type StaircaseConfig struct {
-	Client          *api.Client
-	Req             api.ChatRequest
-	Stream          bool
-	Levels          []int // 并发档位，例如 {1,2,4,8,16}
+	Client           *api.Client
+	Req              api.ChatRequest
+	Stream           bool
+	Levels           []int // 并发档位，例如 {1,2,4,8,16}
 	RequestsPerLevel int64 // 每档请求数（0=用 DurationPerLevel）
 	DurationPerLevel time.Duration
-	CoolDown        time.Duration // 档间冷却
-	Model           string
-	OnLevelStart    func(level, concurrency int)
-	OnProgress      func(Progress)
+	CoolDown         time.Duration // 档间冷却
+	Model            string
+	OnLevelStart     func(level, concurrency int)
+	OnProgress       func(Progress)
 }
 
 // StaircaseResult 是一档的结果

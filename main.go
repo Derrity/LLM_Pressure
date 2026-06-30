@@ -17,9 +17,11 @@ import (
 
 const (
 	defaultPrompt = "Write a continuous original story in English about a developer load-testing a new language model at midnight. Keep it around 350 words, use plain paragraphs, and do not use markdown or bullet lists."
+	burnPrompt    = "Write the longest possible continuous original text you can within the token limit. Use dense English paragraphs, avoid markdown, avoid lists, do not summarize, do not stop early, and continue expanding the same story with concrete details until the response is complete."
 
 	defaultRequests    = 32
 	defaultMaxTokens   = 512
+	defaultBurnTokens  = 4096
 	defaultTemperature = 0.0
 	probeMaxTokens     = 64
 	probeTimeout       = 90 * time.Second
@@ -33,6 +35,10 @@ type cliOptions struct {
 	profileName string
 	baseURL     string
 	models      []string
+	listModels  bool
+	duration    time.Duration
+	maxTokens   int
+	burn        bool
 }
 
 func main() {
@@ -48,7 +54,12 @@ func main() {
 	ctx, cancel := runner.InstallSignalHandler()
 	defer cancel()
 
-	if opts.concurrency > 0 {
+	if opts.listModels {
+		listModelsFromFlags(ctx, cfg, opts)
+		return
+	}
+
+	if opts.concurrency > 0 || opts.burn {
 		runFromFlags(ctx, cfg, opts)
 		return
 	}
@@ -58,30 +69,58 @@ func main() {
 
 func parseFlags() cliOptions {
 	var opts cliOptions
+	args, listModels := preprocessListModelArgs(os.Args[1:])
+	opts.listModels = listModels
 	flag.IntVar(&opts.concurrency, "t", 0, "固定并发线程数；设置后不进入交互选择，直接跑固定并发")
-	flag.IntVar(&opts.requests, "n", defaultRequests, "总请求数；固定并发为总量，交互阶梯扫描为每档请求数")
+	flag.IntVar(&opts.requests, "n", defaultRequests, "总请求数；固定并发为总量，交互阶梯扫描为每档请求数；固定并发下设为 0 表示持续运行直到 Ctrl+C")
 	flag.StringVar(&opts.profileName, "profile", "", "使用指定 profile 名称")
 	flag.StringVar(&opts.baseURL, "url", "", "临时 Base URL；可传 host、/v1，或完整 /v1/chat/completions")
+	flag.BoolVar(&opts.listModels, "models", opts.listModels, "只列出可用模型 ID，不执行压测")
+	flag.DurationVar(&opts.duration, "d", 0, "固定并发运行时长，例如 30s、10m、1h；设置后按时长停止")
+	flag.IntVar(&opts.maxTokens, "max-tokens", defaultMaxTokens, "每次请求的 max_tokens")
+	flag.BoolVar(&opts.burn, "burn", false, "持续高 token 消耗模式：默认 max_tokens=4096、长输出 prompt、一直跑到 Ctrl+C（可配合 -d 或 -n 限制）")
 	var modelFlags modelFlag
-	flag.Var(&modelFlags, "model", "使用指定模型 ID；多个模型可用逗号分隔或重复传入")
+	flag.Var(&modelFlags, "model", "使用指定模型 ID；多个模型可用逗号分隔或重复传入；不带值时列出模型 ID")
 	profileShort := flag.String("p", "", "使用指定 profile 名称（简写）")
 	urlShort := flag.String("u", "", "临时 Base URL（简写）；不写入 config.json")
-	flag.Var(&modelFlags, "m", "使用指定模型 ID（简写）；多个模型可用逗号分隔或重复传入")
+	flag.Var(&modelFlags, "m", "使用指定模型 ID（简写）；多个模型可用逗号分隔或重复传入；不带值时列出模型 ID")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "用法:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s                  交互选择 provider/model，默认跑阶梯扫描\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -t 8 -n 32       使用默认 profile 和上次模型，直接跑固定并发\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m                 列出该 provider 的模型 ID\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -u https://api.example.com/v1 -m       列出临时 URL 的模型 ID\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2 -t 8 -n 32\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2 -t 8 -burn\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2 -t 8 -burn -d 30m\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -u https://api.example.com/v1/chat/completions -m glm-5.2 -t 8 -n 32\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -p example-provider -m glm-5.2,kimi-2.6 -t 8 -n 32\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
-	flag.Parse()
+	flag.CommandLine.Parse(args)
+	visited := visitedFlags()
 	if *profileShort != "" {
 		opts.profileName = *profileShort
 	}
 	if *urlShort != "" {
 		opts.baseURL = *urlShort
+	}
+	if opts.burn {
+		if opts.concurrency == 0 {
+			opts.concurrency = 1
+		}
+		if !visited["max-tokens"] {
+			opts.maxTokens = defaultBurnTokens
+		}
+		if !visited["n"] && opts.duration == 0 {
+			opts.requests = 0
+		}
+	}
+	if opts.duration > 0 {
+		if visited["n"] {
+			die("-d 和 -n 不能同时使用；按时长跑请只传 -d，按请求数跑请只传 -n")
+		}
+		opts.requests = 0
 	}
 	opts.models = modelFlags.Models()
 	if flag.NArg() > 0 {
@@ -90,10 +129,56 @@ func parseFlags() cliOptions {
 	if opts.concurrency < 0 {
 		die("-t 必须大于 0")
 	}
-	if opts.requests <= 0 {
-		die("-n 必须大于 0")
+	if opts.requests < 0 {
+		die("-n 必须大于或等于 0")
+	}
+	if opts.concurrency == 0 && opts.requests == 0 {
+		die("交互阶梯模式下 -n 必须大于 0；持续运行请使用 -t 或 -burn")
+	}
+	if opts.maxTokens <= 0 {
+		die("-max-tokens 必须大于 0")
 	}
 	return opts
+}
+
+func visitedFlags() map[string]bool {
+	visited := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	return visited
+}
+
+func preprocessListModelArgs(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	listModels := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			out = append(out, args[i:]...)
+			break
+		}
+		if isBareModelFlag(arg, args, i) {
+			listModels = true
+			if i+1 < len(args) && args[i+1] == "" {
+				i++
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, listModels
+}
+
+func isBareModelFlag(arg string, args []string, i int) bool {
+	switch arg {
+	case "-m", "--m", "-model", "--model":
+		return i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-")
+	case "-m=", "--m=", "-model=", "--model=":
+		return true
+	default:
+		return false
+	}
 }
 
 func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
@@ -121,8 +206,10 @@ func runInteractive(ctx context.Context, cfg *config.File, opts cliOptions) {
 	params := testParams{
 		requests:    int64(opts.requests),
 		stairLevels: append([]int(nil), defaultStairLevels...),
+		maxTokens:   defaultMaxTokens,
+		prompt:      defaultPrompt,
 	}
-	printBuiltinSettings("staircase", fmt.Sprintf("levels=%v  requests/level=%d", params.stairLevels, params.requests))
+	printBuiltinSettings("staircase", params.maxTokens, fmt.Sprintf("levels=%v  requests/level=%d", params.stairLevels, params.requests), false)
 	runStaircaseForModels(ctx, client, params, models)
 }
 
@@ -154,9 +241,38 @@ func runFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
 	params := testParams{
 		concurrency: opts.concurrency,
 		requests:    int64(opts.requests),
+		duration:    opts.duration,
+		maxTokens:   opts.maxTokens,
+		prompt:      defaultPrompt,
+		burn:        opts.burn,
 	}
-	printBuiltinSettings("fixed concurrency", fmt.Sprintf("threads=%d  requests=%d", params.concurrency, params.requests))
+	if opts.burn {
+		params.prompt = burnPrompt
+	}
+	printBuiltinSettings("fixed concurrency", params.maxTokens, fixedRunDetail(params), params.burn)
 	runFixedForModels(ctx, client, params, models)
+}
+
+func listModelsFromFlags(ctx context.Context, cfg *config.File, opts cliOptions) {
+	profile := selectProfileFromFlags(cfg, opts.profileName, opts.baseURL)
+	printProvider(profile)
+
+	client := api.New(profile.BaseURL, profile.APIKey)
+	fmt.Println()
+	fmt.Println(term.Cyan("Listing available model IDs..."))
+	models, err := client.ListModels(ctx)
+	if err != nil {
+		die("查询模型失败: %v", err)
+	}
+	if len(models) == 0 {
+		fmt.Println("未发现可用模型。")
+		return
+	}
+
+	fmt.Printf("\n%s %d\n", colorLabel("Models", 11), len(models))
+	for _, model := range models {
+		fmt.Printf("  %s\n", model.ID)
+	}
 }
 
 // ---- 流程步骤 ----
@@ -223,7 +339,11 @@ func selectModels(ctx context.Context, client *api.Client) []string {
 type testParams struct {
 	concurrency int
 	requests    int64
+	duration    time.Duration
 	stairLevels []int
+	maxTokens   int
+	prompt      string
+	burn        bool
 }
 
 type modelFlag struct {
@@ -289,21 +409,32 @@ func mustNormalizeBaseURL(raw string) string {
 	return baseURL
 }
 
-func defaultChatRequest(model string) api.ChatRequest {
+func chatRequest(model string, p testParams) api.ChatRequest {
+	maxTokens := p.maxTokens
+	if maxTokens <= 0 {
+		maxTokens = defaultMaxTokens
+	}
+	prompt := p.prompt
+	if prompt == "" {
+		prompt = defaultPrompt
+	}
 	return api.ChatRequest{
 		Model:       model,
-		Messages:    []api.Message{{Role: "user", Content: defaultPrompt}},
-		MaxTokens:   defaultMaxTokens,
+		Messages:    []api.Message{{Role: "user", Content: prompt}},
+		MaxTokens:   maxTokens,
 		Temperature: defaultTemperature,
 	}
 }
 
-func printBuiltinSettings(mode, detail string) {
+func printBuiltinSettings(mode string, maxTokens int, detail string, burn bool) {
 	fmt.Println()
 	fmt.Printf("%s %s\n", colorLabel("Preset", 11), mode)
-	fmt.Printf("%s max=%d  temperature=%.1f\n", colorLabel("Tokens", 11), defaultMaxTokens, defaultTemperature)
+	fmt.Printf("%s max=%d  temperature=%.1f\n", colorLabel("Tokens", 11), maxTokens, defaultTemperature)
 	fmt.Printf("%s %s\n", colorLabel("Run", 11), detail)
 	fmt.Printf("%s %s\n", colorLabel("Modes", 11), "auto-detect non-stream and stream")
+	if burn {
+		fmt.Printf("%s %s\n", colorLabel("Burn", 11), "long-output prompt; press Ctrl+C to stop and print collected stats")
+	}
 }
 
 func runFixedForModels(ctx context.Context, client *api.Client, p testParams, models []string) {
@@ -313,7 +444,7 @@ func runFixedForModels(ctx context.Context, client *api.Client, p testParams, mo
 			break
 		}
 		printModelRunHeader(idx+1, len(models), model)
-		all = append(all, runFixedAuto(ctx, client, defaultChatRequest(model), p, model)...)
+		all = append(all, runFixedAuto(ctx, client, chatRequest(model, p), p, model)...)
 	}
 	runner.PrintModelSummary(all)
 }
@@ -340,7 +471,7 @@ func runStaircaseForModels(ctx context.Context, client *api.Client, p testParams
 			break
 		}
 		printModelRunHeader(idx+1, len(models), model)
-		all = append(all, runStaircaseAuto(ctx, client, defaultChatRequest(model), p, model)...)
+		all = append(all, runStaircaseAuto(ctx, client, chatRequest(model, p), p, model)...)
 	}
 	runner.PrintStaircaseModelSummary(all)
 }
@@ -393,8 +524,8 @@ func detectSupportedModes(ctx context.Context, client *api.Client, req api.ChatR
 
 func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p testParams, model string, stream bool) (runner.Stats, bool) {
 	progressCb := makeProgressCB()
-	fmt.Printf("\n%s %s  concurrency=%d  requests=%d\n",
-		term.Cyan("Running"), modeName(stream), p.concurrency, p.requests)
+	fmt.Printf("\n%s %s  concurrency=%d  %s\n",
+		term.Cyan("Running"), modeName(stream), p.concurrency, fixedStopLabel(p))
 
 	stats, samples := runner.RunFixed(ctx, runner.RunConfig{
 		Client:      client,
@@ -402,6 +533,7 @@ func runFixed(ctx context.Context, client *api.Client, req api.ChatRequest, p te
 		Stream:      stream,
 		Concurrency: p.concurrency,
 		Requests:    p.requests,
+		Duration:    p.duration,
 		Model:       model,
 		OnProgress:  progressCb,
 	})
@@ -462,6 +594,21 @@ func runStaircase(ctx context.Context, client *api.Client, req api.ChatRequest, 
 		fmt.Printf("\n保存报告失败: %v\n", err)
 	}
 	return results
+}
+
+func fixedRunDetail(p testParams) string {
+	return fmt.Sprintf("threads=%d  %s", p.concurrency, fixedStopLabel(p))
+}
+
+func fixedStopLabel(p testParams) string {
+	switch {
+	case p.duration > 0:
+		return fmt.Sprintf("duration=%s", p.duration)
+	case p.requests > 0:
+		return fmt.Sprintf("requests=%d", p.requests)
+	default:
+		return "requests=unlimited (Ctrl+C to stop)"
+	}
 }
 
 func makeProgressCB() func(runner.Progress) {
